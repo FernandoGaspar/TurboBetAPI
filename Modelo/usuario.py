@@ -4,62 +4,118 @@ import pandas as pd
 import datetime
 import secrets
 from Mensageria import EmailHelpMe
+import logging
+import pyodbc
+logger = logging.getLogger(__name__)
+
+
+def _ensure_conn():
+    """Garante que conectorSQL.conn está ativo; tenta reconectar uma vez se necessário."""
+    conn = getattr(conectorSQL, 'conn', None)
+    try:
+        # Teste barato: SELECT 1
+        if conn is None:
+            raise RuntimeError("conn is None")
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return conn
+    except Exception:
+        # tenta reconectar se o módulo expuser um método adequado
+        try:
+            if hasattr(conectorSQL, 'reconnect'):
+                conn = conectorSQL.reconnect()
+            elif hasattr(conectorSQL, 'connect'):
+                conn = conectorSQL.connect()
+            elif hasattr(conectorSQL, 'get_connection'):
+                conn = conectorSQL.get_connection()
+            else:
+                # Recarrega o módulo para refazer o conn
+                import importlib
+                conn = importlib.reload(conectorSQL).conn
+        except Exception as e:
+            logger.exception("[DB] Falha ao reconectar: %s", e)
+            raise
+        # Testa de novo
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return conn
 
 def Login(email, senha, macaddress, dispositivo):
-    conexao = conectorSQL.conn
+    # 0) Garante conexão viva
+    conexao = _ensure_conn()
 
-    # 1) Executa o procedimento de login (mantém seu fluxo atual)
-    #    Observação: se o seu proc já insere/gera token, ele deve retornar pelo menos idUsuario e Token
-    query_proc = "pr_realizaLogin '" + email + "', '" + senha + "', '" + macaddress + "', '" + dispositivo + "'"
-    df_proc = pd.read_sql(query_proc, conexao)
-    conexao.commit()
+    # Helper para executar SQL com retry em 08S01
+    def _read_sql_retry(sql: str, params=None):
+        try:
+            return pd.read_sql(sql, conexao, params=params)
+        except Exception as e:
+            # Se for falha de link (08S01), tenta reconectar 1x e repetir
+            msg = str(e)
+            if isinstance(e, (pyodbc.Error, pyodbc.OperationalError)) or '08S01' in msg:
+                logger.warning("[DB] 1/1 retry após erro: %s", msg)
+                nonlocal_conn = _ensure_conn()
+                return pd.read_sql(sql, nonlocal_conn, params=params)
+            raise
 
-    # Se o proc não autenticou, devolve exatamente o que ele retornou (compatibilidade com a API)
+    # 1) Executa o procedimento de login de forma segura (parametrizada)
+    # Observação importante: usar EXEC com parâmetros evita concatenação e problemas de aspas
+    sql_proc = "SET NOCOUNT ON; EXEC pr_realizaLogin ?, ?, ?, ?"
+    try:
+        df_proc = _read_sql_retry(sql_proc, params=[email, senha, macaddress, dispositivo])
+    except Exception as e:
+        logger.exception("[LOGIN] Falha ao executar pr_realizaLogin: %s", e)
+        # Retorna estrutura padrão de falha para a API traduzir em 401/500 conforme regra
+        return pd.DataFrame([{"idUsuario": "", "Token": "0", "_err": str(e)}])
+
+    try:
+        conexao.commit()
+    except Exception:
+        pass
+
+    # Se não autenticou
     if df_proc is None or df_proc.empty:
         return pd.DataFrame([{"idUsuario": "", "Token": "0"}])
 
-    # 2) Extrai idUsuario e token do retorno do proc
-    #    (pelos logs anteriores, ele retorna colunas 'idUsuario' e 'Token')
+    # 2) Extrai idUsuario e token
     id_usuario = None
     token_proc = None
     try:
-        id_usuario = int(df_proc.iloc[0]["idUsuario"]) if "idUsuario" in df_proc.columns else None
-    except Exception:
-        id_usuario = df_proc.iloc[0].get("idUsuario")
+        if "idUsuario" in df_proc.columns:
+            try:
+                id_usuario = int(df_proc.iloc[0]["idUsuario"])  # tenta converter
+            except Exception:
+                id_usuario = df_proc.iloc[0]["idUsuario"]
+        if "Token" in df_proc.columns:
+            token_proc = df_proc.iloc[0]["Token"]
+    except Exception as e:
+        logger.warning("[LOGIN] Não foi possível extrair id/token do retorno: %s", e)
 
-    token_proc = df_proc.iloc[0].get("Token") if "Token" in df_proc.columns else None
-
-    # Se não temos idUsuario válido, devolve falha padrão
     if not id_usuario:
         return pd.DataFrame([{"idUsuario": "", "Token": "0"}])
 
-    # 3) Busca nome e email do usuário
-    query_user = """
-        SELECT TOP 1 idUsuario, nome, email
-        FROM dbo.tbUsuario
-        WHERE idUsuario = ?
-    """
-    df_user = pd.read_sql(query_user, conexao, params=[id_usuario])
+    # 3) Busca nome/email
+    sql_user = "SELECT TOP 1 idUsuario, nome, email FROM dbo.tbUsuario WHERE idUsuario = ?"
+    df_user = _read_sql_retry(sql_user, params=[id_usuario])
 
-    # 4) Garante um token: usa o do proc; se vier vazio/zero, pega o mais recente na tbToken
+    # 4) Token final: prioriza o do proc; se vazio, tenta o mais recente na tbToken
     token_final = str(token_proc or "").strip()
     if token_final in ("", "0", None):
-        query_token = """
-            SELECT TOP 1 TokenCode AS Token
-            FROM dbo.tbToken
-            WHERE idUsuario = ?
-            ORDER BY DataLogin DESC
-        """
-        df_token = pd.read_sql(query_token, conexao, params=[id_usuario])
-        if not df_token.empty:
+        sql_token = (
+            "SELECT TOP 1 TokenCode AS Token FROM dbo.tbToken WHERE idUsuario = ? ORDER BY DataLogin DESC"
+        )
+        df_token = _read_sql_retry(sql_token, params=[id_usuario])
+        if df_token is not None and not df_token.empty:
             token_final = df_token.iloc[0]["Token"]
         else:
             token_final = "0"
 
-    # 5) Monta saída consolidada com as colunas esperadas pelo frontend/API
+    # 5) Saída consolidada
     if df_user is None or df_user.empty:
-        # Se por algum motivo não achou o usuário (não deveria acontecer), devolve estrutura mínima
-        return pd.DataFrame([{ "idUsuario": id_usuario, "nome": "", "email": email, "Token": token_final }])
+        return pd.DataFrame([
+            {"idUsuario": id_usuario, "nome": "", "email": email, "Token": token_final}
+        ])
 
     out = df_user[["idUsuario", "nome", "email"]].copy()
     out["Token"] = token_final
