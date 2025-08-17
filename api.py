@@ -11,7 +11,7 @@ import json
 from flask import Flask, request, jsonify, Response
 from flask_restful import Resource, Api
 from flask_cors import CORS
-from Modelo import usuario
+from Modelo import usuario, transacao
 
 
 PORTA = 8090
@@ -126,10 +126,61 @@ class Cadastro(Resource):
         logging.info(f"[CADASTRO] success={success}")
         return jsonify({"success": success})
 
+class getTransacoes(Resource):
+    def post(self): 
+        x = request.stream.read()
+        y = json.loads(x)
+        idUsuario = y["idUsuario"]
+        dispositivo = request.headers.get('User-Agent')
+        macaddress = request.remote_addr
+        
+        df = transacao.getTransacoesUsuario(idUsuario)
+        result = df.to_json(orient='records')
+        print (result)
+        return jsonify(result)   
+
+class setTransacoes(Resource):
+    def post(self): 
+        x = request.stream.read()
+        y = json.loads(x)
+        idUsuario = y["idUsuario"]
+        direcao = y["direcao"]
+        valor = y["valor"]
+        tipoOrigem = y["tipoOrigem"]
+
+        dispositivo = request.headers.get('User-Agent')
+        macaddress = request.remote_addr
+        
+        try:
+            transacao.setTransacao(idUsuario, direcao, valor, tipoOrigem)
+            return jsonify({"success": True})
+        except Exception as e:
+            # log opcional
+            # import logging; logging.exception("[setTransacoes] erro")
+            return jsonify({"success": False, "error": "db_error"}), 500
+
+class getSaldo(Resource):
+    def post(self): 
+        x = request.stream.read()
+        y = json.loads(x)
+        idUsuario = y["idUsuario"]
+        dispositivo = request.headers.get('User-Agent')
+        macaddress = request.remote_addr
+        
+        df = transacao.getSaldo(idUsuario)
+        result = df.to_json(orient='records')
+        print (result)
+        return jsonify(result)   
+
+
 #Main
 api.add_resource(Login, '/login')
-
 api.add_resource(Cadastro, '/cadastro')
+
+#Transacoes
+api.add_resource(getTransacoes, '/getTransacoes')
+api.add_resource(setTransacoes, '/setTransacoes')
+api.add_resource(getSaldo, '/getSaldo')
 
 @app.route('/health')
 def health():
